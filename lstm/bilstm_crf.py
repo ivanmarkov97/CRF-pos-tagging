@@ -165,8 +165,6 @@ for i in range(10):
 def calculate_accuracy(y_true, y_pred):
   assert y_true.shape == y_pred.shape
   assert len(y_true.shape) == 1
-  y_true = y_true[1:]
-  y_pred = y_pred[1:]
   return (y_true == y_pred).sum() / y_true.shape[0]
 
 total_true_labels = []
