@@ -7,7 +7,7 @@ Original file is located at
     https://colab.research.google.com/drive/1HDsX4cW2ywk_gfR4edl7G9yjHsyqu6mV
 """
 
-#!pip install --quiet pytorch-crf
+!pip install --quiet pytorch-crf
 
 import os
 import random
@@ -73,7 +73,7 @@ test_iterator = BucketIterator.splits((test_data,), batch_size=batch_size, devic
 
 class BiLSTM_CRF_Tagger(nn.Module):
 
-  def __init__(self, vocab_size, emb_size, hidden_size, n_layers, dropout, num_tags, pad_idx):
+  def __init__(self, vocab_size, emb_size, hidden_size, n_layers, dropout, num_tags, pad_idx, device):
     super().__init__()
     self.embedding = nn.Embedding(vocab_size, emb_size, padding_idx=pad_idx)
     self.rnn = nn.LSTM(emb_size,
@@ -86,6 +86,7 @@ class BiLSTM_CRF_Tagger(nn.Module):
     self.dropout = nn.Dropout(dropout)
     self.hidden2tag = nn.Linear(emb_size, num_tags)
     self.crf = CRF(num_tags, batch_first=True)
+    self.device = device
 
   def _generate_mask(self, text_lens):
     bs = text_lens.size(0)
@@ -104,7 +105,7 @@ class BiLSTM_CRF_Tagger(nn.Module):
     last_hidden = last_hidden.permute(1, 0, 2)
 
     emission = self.hidden2tag(text_unpacked)
-    mask = self._generate_mask(text_lens).to(device)
+    mask = self._generate_mask(text_lens).to(self.device)
 
     if tags is not None:
       loss = -self.crf.forward(torch.log_softmax(emission, dim=2), tags, mask, reduction='mean')
@@ -122,21 +123,18 @@ NUM_TAGS = len(LABEL.vocab)
 PAD_IDX = LABEL.vocab.stoi['<pad>']
 
 
-model = BiLSTM_CRF_Tagger(VOCAB_SIZE, EMB_SIZE, HIDDEN_SIZE, N_LAYERS, DROPOUT, NUM_TAGS, PAD_IDX)
+model = BiLSTM_CRF_Tagger(VOCAB_SIZE, EMB_SIZE, HIDDEN_SIZE, N_LAYERS, DROPOUT, NUM_TAGS, PAD_IDX, device)
 optimizer = torch.optim.Adam(model.parameters())
 
 model.embedding.weight.data.copy_(TEXT.vocab.vectors)
 
 model = model.to(device)
 
-from tqdm import tqdm
-
-
-for i in range(10):
+def train_epoch(model, iterator, optimizer):
   model.train()
   error = 0.
 
-  for batch in tqdm(train_iterator):
+  for batch in iterator:
     optimizer.zero_grad()
 
     text, lens = batch.text
@@ -148,52 +146,134 @@ for i in range(10):
 
     optimizer.step()
     error += loss.detach().cpu().numpy()
-  print('train error', error / len(train_iterator))
+  return error / len(iterator)
 
+def valid_epoch(model, iterator):
   error = 0.
   model.eval()
   with torch.no_grad():
-    for batch in tqdm(valid_iterator):
+    for batch in iterator:
       text, lens = batch.text
       lens = lens.cpu()
       tags = batch.tags
       
       loss = model(text, lens, tags)
       error += loss.detach().cpu().numpy()
-    print('valid error', error / len(valid_iterator))
+  return error / len(iterator)
+
+from sklearn.metrics import f1_score
+
 
 def calculate_accuracy(y_true, y_pred):
   assert y_true.shape == y_pred.shape
   assert len(y_true.shape) == 1
+  y_true = y_true[1:]
+  y_pred = y_pred[1:]
   return (y_true == y_pred).sum() / y_true.shape[0]
 
-total_true_labels = []
-total_pred_labels = []
 
-for index in range(len(test_data.examples)):
+def calculate_metrics(model, dataset, device):
 
-  text = test_data.examples[index].text
-  true_labels = test_data.examples[index].tags
+  total_true_labels = []
+  total_pred_labels = []
 
-  with torch.no_grad():
-    tokens = text
-    ids = [TEXT.vocab.stoi[token] for token in tokens]
-    ids_tensor = torch.tensor([ids], device=device)
-    lens = torch.tensor([len(ids)])
-    prediction = model(ids_tensor, lens)
-    
-  print('\t'.join(tokens))
-  print('\t'.join(true_labels))
-  print('\t'.join([LABEL.vocab.itos[p] for p in prediction[0]]))
-  print('='*20)
+  for index in range(len(dataset.examples)):
 
-  total_true_labels.extend(np.array([LABEL.vocab.itos[p] for p in prediction[0]]))
-  total_pred_labels.extend(np.array(true_labels))
+    text = dataset.examples[index].text
+    true_labels = dataset.examples[index].tags
 
-print(calculate_accuracy(np.array(total_true_labels), np.array(total_pred_labels)))
+    with torch.no_grad():
+      tokens = text
+      ids = [TEXT.vocab.stoi[token] for token in tokens]
+      ids_tensor = torch.tensor([ids], device=device)
+      lens = torch.tensor([len(ids)])
+      prediction = model(ids_tensor, lens)
+      
+    # print('\t'.join(tokens))
+    # print('\t'.join(true_labels))
+    # print('\t'.join([LABEL.vocab.itos[p] for p in prediction[0]]))
+    # print('='*20)
 
-from sklearn.metrics import classification_report
+    total_true_labels.extend(np.array([LABEL.vocab.itos[p] for p in prediction[0]]))
+    total_pred_labels.extend(np.array(true_labels))
+
+  accurary = calculate_accuracy(np.array(total_true_labels), np.array(total_pred_labels))
+  f1 = f1_score(np.array(total_true_labels), np.array(total_pred_labels), average='macro')
+  print(f'Accuracy: {accurary}, F1: {f1}')
+
+for epoch in range(10):
+  train_error = train_epoch(model, train_iterator, optimizer)
+  valid_error = valid_epoch(model, valid_iterator)
+
+  print(f'Epoch: {epoch + 1}. Train: {train_error}, Valid: {valid_error}')
+  calculate_metrics(model, test_data, device)
+
+# from sklearn.metrics import classification_report
 
 
-print(classification_report(np.array(total_true_labels), np.array(total_pred_labels)))
+# print(classification_report(np.array(total_true_labels), np.array(total_pred_labels)))
+
+"""## Pruning"""
+
+# import torch.nn.utils.prune as prune
+
+
+# classifier = model.hidden2tag
+
+# for name, param in classifier.named_parameters():
+#   print(name, param)
+
+# prune.random_unstructured(classifier, name='weight', amount=0.3)
+# prune.l1_unstructured(classifier, name="bias", amount=3)
+
+# for name, param in classifier.named_parameters():
+#   print(name, param)
+
+# print(list(classifier.named_buffers()))
+# print(classifier.weight)
+# print(classifier._forward_pre_hooks)
+
+# prune.remove(classifier, 'weight')
+# prune.remove(classifier, 'bias')
+
+# print(torch.sum(model.hidden2tag.weight == 0) / model.hidden2tag.weight.nelement() * 100)
+# print(calculate_metrics(model, test_data))
+
+# for epoch in range(2):
+#   train_error = train_epoch(model, train_iterator, optimizer)
+#   valid_error = valid_epoch(model, valid_iterator)
+
+#   print(f'Epoch: {epoch + 1}. Train: {train_error}, Valid: {valid_error}')
+#   calculate_metrics(model, test_data)
+
+"""## Quantization"""
+
+model = model.cpu()
+
+from torch.quantization import quantize_dynamic
+
+
+quantized_model = torch.quantization.quantize_dynamic(
+    model, {nn.LSTM, nn.Linear}, dtype=torch.qint8
+)
+
+print(quantized_model)
+
+def print_size_of_model(model):
+    torch.save(model.state_dict(), "temp.p")
+    print('Size (MB):', os.path.getsize("temp.p")/1e6)
+    os.remove('temp.p')
+
+print_size_of_model(model)
+print_size_of_model(quantized_model)
+
+model = model.to(device)
+quantized_model = quantized_model.to(device)
+
+cpu_device = torch.device('cpu')
+quantized_model.device = cpu_device
+quantized_model.to(cpu_device)
+
+print(calculate_metrics(model, test_data, device))
+print(calculate_metrics(quantized_model, test_data, cpu_device))
 
